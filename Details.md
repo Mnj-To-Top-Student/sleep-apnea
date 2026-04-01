@@ -233,7 +233,7 @@ probability of apnea
 
 ---
 
-# 🧠 8. MODEL 2 — CNN + LSTM
+# 🧠 8. MODEL 2 — CNN-LSTM Hybrid Network
 
 ### Input:
 
@@ -263,7 +263,7 @@ probability of apnea
 
 ---
 
-# 🧠 9. MULTIMODAL FUSION
+# 🧠 9. HYBRID FEATURE FUSION
 
 Inside CNN model:
 
@@ -285,8 +285,10 @@ Inside CNN model:
 
 ### Model:
 
+The meta-model learns to optimally combine predictions from both models.
+
 ```text
-Logistic Regression
+XGBClassifier
 ```
 
 ---
@@ -306,6 +308,8 @@ Raw ECG → segmentation → normalized segments
 → Path 2: Raw signal → CNN + LSTM
 
 → Combine predictions → stacking → final output
+
+Feature-level fusion is performed within the deep learning model, while decision-level fusion is achieved through stacking.
 ```
 
 ---
