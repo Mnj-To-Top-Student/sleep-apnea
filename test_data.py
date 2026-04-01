@@ -5,32 +5,78 @@ from scipy.signal import find_peaks
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import spectrogram
-from tensorflow.keras import layers, models
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import layers
 from scipy.stats import skew, kurtosis
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
 
-def transformer_block(x, head_size=64, num_heads=4, ff_dim=128):
-    attn = layers.MultiHeadAttention(
-        num_heads=num_heads, key_dim=head_size
-    )(x, x)
-    
-    x = layers.Add()([x, attn])
-    x = layers.LayerNormalization()(x)
-    
-    ff = layers.Dense(ff_dim, activation='relu')(x)
-    ff = layers.Dense(x.shape[-1])(ff)
-    
-    x = layers.Add()([x, ff])
-    x = layers.LayerNormalization()(x)
-    
-    return x
+class FusionNet(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+
+        self.signal_conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+        )
+
+        self.signal_lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.signal_lstm_2 = nn.LSTM(
+            input_size=128,
+            hidden_size=32,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.signal_fc = nn.Linear(64, 64)
+
+        self.feature_fc = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(64 + 32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, signal, feature):
+        # signal: (batch, 1, 3000)
+        x = self.signal_conv(signal)
+        x = x.transpose(1, 2)  # (batch, seq_len, channels)
+        x, _ = self.signal_lstm(x)
+        x, _ = self.signal_lstm_2(x)
+        x = x[:, -1, :]
+        cnn_out = torch.relu(self.signal_fc(x))
+
+        feat_out = self.feature_fc(feature)
+
+        combined = torch.cat([cnn_out, feat_out], dim=1)
+        logits = self.classifier(combined).squeeze(1)
+        return logits
 
 
 def get_spectrogram(segment, fs=100):
@@ -92,10 +138,6 @@ def extract_features(segment, fs=100):
         max_rr, min_rr, median_rr, q25_rr, q75_rr
     ])
     
-    
-    # RR features
-    features.append(np.max(rr_intervals) if len(peaks)>2 else 0)
-    features.append(np.min(rr_intervals) if len(peaks)>2 else 0)
 
     energy = np.sum(segment**2)
     features.append(energy)
@@ -174,7 +216,8 @@ for rec in records:
             if np.any(np.isnan(segment)) or np.any(np.isinf(segment)):
                 continue          
             all_segments.append(segment)
-            label_idx = start // window_size
+            center = (start + end) // 2
+            label_idx = center // window_size
             if label_idx < len(labels):
                 all_labels.append(1 if labels[label_idx] == 'A' else 0)
 
@@ -248,67 +291,95 @@ X_signal_test = X_signal[test_idx]
 X_feat_train, X_feat_test = X_features[train_idx], X_features[test_idx]
 
 
-# ------ CNN / LTSM
+# ------ CNN / LSTM (PyTorch)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-signal_input = layers.Input(shape=(3000, 1))
+X_signal_train_t = torch.tensor(X_signal_train.transpose(0, 2, 1), dtype=torch.float32)
+X_signal_test_t = torch.tensor(X_signal_test.transpose(0, 2, 1), dtype=torch.float32)
+X_feat_train_t = torch.tensor(X_feat_train, dtype=torch.float32)
+X_feat_test_t = torch.tensor(X_feat_test, dtype=torch.float32)
+y_train_t = torch.tensor(y_train, dtype=torch.float32)
+y_test_t = torch.tensor(y_test, dtype=torch.float32)
 
-x = layers.Conv1D(32, kernel_size=5, padding='same', activation='relu')(signal_input)
-x = layers.BatchNormalization()(x)
-x = layers.MaxPooling1D(pool_size=2)(x)
+train_dataset = TensorDataset(X_signal_train_t, X_feat_train_t, y_train_t)
+test_dataset = TensorDataset(X_signal_test_t, X_feat_test_t, y_test_t)
 
-x = layers.Conv1D(64, kernel_size=5, padding='same', activation='relu')(x)
-x = layers.BatchNormalization()(x)
-x = layers.MaxPooling1D(pool_size=2)(x)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-x = layers.Conv1D(128, kernel_size=3, padding='same', activation='relu')(x)
-x = layers.BatchNormalization()(x)
+fusion_model = FusionNet(feature_dim=X_features.shape[1]).to(device)
 
-# LSTM for temporal patterns
-x = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(x)
-x = layers.Bidirectional(layers.LSTM(32))(x)
+pos_weight = torch.tensor([23514 / 14664], dtype=torch.float32, device=device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer = torch.optim.Adam(fusion_model.parameters(), lr=0.0002)
 
-cnn_out = layers.Dense(64, activation='relu')(x)
+epochs = 20
+for epoch in range(epochs):
+    fusion_model.train()
+    running_loss = 0.0
 
-# ---- FEATURE BRANCH ----
-feature_input = layers.Input(shape=(X_features.shape[1],))
+    for sig_batch, feat_batch, y_batch in train_loader:
+        sig_batch = sig_batch.to(device)
+        feat_batch = feat_batch.to(device)
+        y_batch = y_batch.to(device)
 
-f = layers.Dense(64, activation='relu')(feature_input)
-f = layers.Dense(32, activation='relu')(f)
+        optimizer.zero_grad()
+        logits = fusion_model(sig_batch, feat_batch)
+        loss = criterion(logits, y_batch)
+        loss.backward()
+        optimizer.step()
 
-# ---- FUSION ----
-combined = layers.concatenate([cnn_out, f])
+        running_loss += loss.item() * sig_batch.size(0)
 
-z = layers.Dense(64, activation='relu')(combined)
-z = layers.Dense(1, activation='sigmoid')(z)
+    avg_loss = running_loss / len(train_loader.dataset)
 
-model = models.Model(inputs=[signal_input, feature_input], outputs=z)
+    fusion_model.eval()
+    correct = 0
+    total = 0
 
-model.compile(
-    optimizer=Adam(learning_rate=0.0002),
-    loss='binary_crossentropy',
-    metrics=['accuracy']
-)
+    with torch.no_grad():
+        for sig_batch, feat_batch, y_batch in test_loader:
+            sig_batch = sig_batch.to(device)
+            feat_batch = feat_batch.to(device)
+            y_batch = y_batch.to(device)
 
-model.summary()
-class_weight = {
-    0: 1.0,
-    1: 23514 / 14664
-}
+            logits = fusion_model(sig_batch, feat_batch)
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).float()
 
-model.fit(
-    [X_signal_train, X_feat_train],
-    y_train,
-    epochs=20,
-    batch_size=32,
-    validation_data=([X_signal_test, X_feat_test], y_test),
-    class_weight=class_weight
-)
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
 
-cnn_train_prob = model.predict([X_signal_train, X_feat_train]).flatten()
-cnn_test_prob = model.predict([X_signal_test, X_feat_test]).flatten()
+    val_acc = correct / total if total > 0 else 0.0
+    print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f} - val_acc: {val_acc:.4f}")
 
-loss, acc = model.evaluate([X_signal_test, X_feat_test], y_test)
-print("Fusion Accuracy:", acc)
+
+def predict_probs(model, signal_arr, feature_arr, batch_size=64):
+    model.eval()
+    sig_t = torch.tensor(signal_arr.transpose(0, 2, 1), dtype=torch.float32)
+    feat_t = torch.tensor(feature_arr, dtype=torch.float32)
+    dummy_y = torch.zeros(len(sig_t), dtype=torch.float32)
+
+    loader = DataLoader(TensorDataset(sig_t, feat_t, dummy_y), batch_size=batch_size, shuffle=False)
+    all_probs = []
+
+    with torch.no_grad():
+        for sig_batch, feat_batch, _ in loader:
+            sig_batch = sig_batch.to(device)
+            feat_batch = feat_batch.to(device)
+            logits = model(sig_batch, feat_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+
+    return np.concatenate(all_probs)
+
+
+cnn_train_prob = predict_probs(fusion_model, X_signal_train, X_feat_train)
+cnn_test_prob = predict_probs(fusion_model, X_signal_test, X_feat_test)
+
+fusion_preds = (cnn_test_prob >= 0.5).astype(int)
+fusion_acc = accuracy_score(y_test, fusion_preds)
+print("Fusion Accuracy:", fusion_acc)
 
 
 
